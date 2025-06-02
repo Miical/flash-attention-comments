@@ -240,6 +240,7 @@ void set_params_dgrad(Flash_bwd_params &params,
     params.deterministic = deterministic;
 }
 
+// 执行 mha_fwd
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
@@ -348,27 +349,44 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 }
 
 std::vector<at::Tensor>
-mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+mha_fwd(
+        // Q 矩阵，[batch, num_tokens, num_heads, demension]
+        at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+        // K 矩阵，[batch, num_tokens, num_heads, demension]
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+        // V 矩阵，[batch, num_tokens, num_heads, demension]
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
+        // 可选的输出矩阵，输出注意力的结果
         std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+        // 每个头的斜率，用于位置编码
         std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
+        // dropout 概率，注意力权重的随机丢弃
         const float p_dropout,
+        // softmax 缩放因子, \sqrt{1/d}
         const float softmax_scale,
+        // 是否使用因果掩码
         bool is_causal,
+        // 用于局部注意力机制
         int window_size_left,
         int window_size_right,
+        // 设置上限，防止softmax过饱和
         const float softcap,
+        // 是否返回softmax
         const bool return_softmax,
+        // 传入的随机数生成器
         std::optional<at::Generator> gen_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
 
+    // get_compute_capability() 获取当前 GPU 的计算能力（compute capability），返回的是一个形如 [8, 0] 的主版本号和次版本号
+    //（例如 Ampere 是 8.x，Volta 是 7.x）。
+    // FlashAttention 在这里限制只支持 Ampere 架构的 GPU 或更新版本
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x_min = cc_major >= 8;
     TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
+    // 检查三个矩阵必须是 fp16 或 bf16, 并且类型相同
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
@@ -377,18 +395,27 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
 
+    // 检查三个矩阵在最后一个维度是连续的
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     const auto sizes = q.sizes();
 
+    // batch 数量
     const int batch_size = sizes[0];
+    // 一个batch中token的数量
     int seqlen_q = sizes[1];
+    // 注意力头的数量
     int num_heads = sizes[2];
+    // 一个token中demension的数量
     const int head_size = sizes[3];
+
+    // k 矩阵的token数量
     const int seqlen_k = k.size(1);
+    // k 矩阵的注意力头的数量
     const int num_heads_k = k.size(2);
+
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
@@ -413,10 +440,13 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         num_heads = num_heads_k;
     }
 
+    // 检查q, k, v的形状
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
     CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size);
 
+    // 检查out的形状
+    // 如果没有就创建一个
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -438,9 +468,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     auto opts = q.options();
 
+    // log(softmax(x)) = x - lse
+    // lse = log(sum(exp(x)))
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor p;
     // Only return softmax if there's dropout to reduce compilation time
+    // 如果需要返回softmax，则创建一个p矩阵，用于存储softmax结果
     if (return_softmax) {
         TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
         p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
@@ -470,6 +503,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      );
 
     // Keep references to these tensors to extend their lifetime
+    // ? splitkv
     at::Tensor softmax_lse_accum, out_accum;
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
@@ -478,6 +512,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     // number of times random will be generated per thread, to offset philox counter in thc random
     // state
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+    // 配置随机数生成器
     int64_t counter_offset = params.b * params.h * 32;
     auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));

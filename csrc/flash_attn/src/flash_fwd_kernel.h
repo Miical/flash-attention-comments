@@ -48,17 +48,24 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
+// !!
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
-inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
+inline __device__ void compute_attn_1rowblock(const Params &params,
+    const int bidb,   // batch 的编号
+    const int bidh,   // head 的编号
+    const int m_block // 当前处理的 q block 的编号
+    ) {
 
-    using Element = typename Kernel_traits::Element;
-    using ElementAccum = typename Kernel_traits::ElementAccum;
-    using index_t = typename Kernel_traits::index_t;
+    // 采用不同的数据类型存储不同的数据
+    using Element = typename Kernel_traits::Element; // 存储 q, k, v 的数据类型
+    using ElementAccum = typename Kernel_traits::ElementAccum; // 存储累加结果的数据类型
+    using index_t = typename Kernel_traits::index_t; // 存储索引的数据类型
 
     // Shared memory.
     extern __shared__ char smem_[];
 
     // The thread index.
+    // tidx 是 block 内的线程索引
     const int tidx = threadIdx.x;
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
@@ -80,15 +87,27 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+    // 设置了 n_block_min 和 n_block_max
+    const int n_block_min =
+        !Is_local ? 0  // 如果不是 local attention，则 n_block_min = 0·
+        :
+        std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     if (Is_causal || Is_local) {
         n_block_max = std::min(n_block_max,
-                               cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+                               cute::ceil_div(
+                                    // m_block 是当前处理的 Q block 的编号，这个编号越大，对应的右边界越往右（下三角矩阵）
+                                    // 再根据 q, k 长度的不一致去做一下偏移
+                                    (m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right,
+                                    kBlockN)
+                                );
+
         // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) {
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
         // }
     }
+
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
@@ -295,9 +314,13 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // If not even_N, then seqlen_k might end in the middle of a block. In that case we need to
     // mask 2 blocks (e.g. when kBlockM == kBlockN), not just 1.
+
+    // n_masking_steps 代表有几个块是含有 masking 边界的
     constexpr int n_masking_steps = (!Is_causal && !Is_local)
-        ? 1
+        ? 1 // 这里即便没有 mask，也会设置成 1，最少运行一次
         : ((Is_even_MN && Is_causal) ? cute::ceil_div(kBlockM, kBlockN) : cute::ceil_div(kBlockM, kBlockN) + 1);
+
+    /* 循环1： 处理含有 mask 边界的 block */
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
@@ -373,6 +396,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             break;
         }
     }
+
+    /* 循环2： 处理完整需要计算的 block */
 
     // These are the iterations where we don't need masking on S
     for (; n_block >= n_block_min; --n_block) {
