@@ -166,12 +166,19 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
                             make_stride(params.k_row_stride, params.k_head_stride, _1{}));
     Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
+
+    // params.v_ptr 是 v 在全局内存中的指针 （然后加上 batch 的偏移）
+    // 把它做成 cute 的 tensor 的形式，建立成 [seq_len_k, n_heads_k, head_dim] (一个Batch)
     Tensor mV = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
                                           + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
                             make_stride(params.v_row_stride, params.v_head_stride, _1{}));
+    // 选出一个 head 来，然后打成 tile，一个头对应 [seq_len_k, 1, head_dim]
+    // 尝试把他切成 [kBlockN(切分了seq_len_k), head_dim] 这样的小块
+    // 最后切完变成 [kBlockN, kHeadDim, nblocksN(切分成的块数)]
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _), Shape<Int<kBlockN>, Int<kHeadDim>>{},
                            make_coord(_, 0));  // (kBlockN, kHeadDim, nblocksN)
+
     Tensor gP = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
                             Shape<Int<kBlockM>, Int<kBlockN>>{},
                             make_stride(params.seqlen_k_rounded, _1{}));
@@ -179,6 +186,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
     // Careful we're using the same smem for sQ and sK | sV if Share_Q_K_smem;
+    // 构建 sK 和 sV 的 shared memory tensor
+    // 从 sQ 的地址开始，sK 紧接着 sQ 后面，sV 紧接着 sK 后面
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
                             typename Kernel_traits::SmemLayoutKV{});
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
@@ -188,11 +197,22 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
 
+    // t: 线程
+    // Q: 计算目标
+    // s: shared memory / g: global memory
+    // Q: 来自哪里
     Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
     Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
     Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);  // (KCPY, KCPY_N, KCPY_K, nblocksN)
     Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+    // 把一个head的数据划分为以拷贝为单位的小块
+    // 这个是每个线程需要处理的一小块，比如 gV 的结构是 (128, 64, 8) 表示把一个 head 划分为了 8 个 [128, 64] 的小块
+    // 如果有 128 个线程，那么 tVgV 就拿到的是自己处理的那部分 ，例如 (1, 16, 4)
+    // VCPY: 需要拷贝几次
+    // (VCPY_N, VCPY_K): 每次拷贝的大小
+    // nblocksN: 建立了多个block的空间，后面会指定某个 id 进行拷贝
     Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
+    // 同样在 shared memory 中建立一个相同的结构，用于存储拷贝进来的数据
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
     typename Kernel_traits::TiledMma tiled_mma;
@@ -232,6 +252,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
     // Tensor tKVpKV = make_tensor<bool>(make_shape(size<1>(tKsK), size<2>(tKsK)), Stride<_1,_0>{});
 
     // Construct identity layout for sQ and sK
+    // make_identity_tensor(shape) 作用是： 构造一个张量，每个元素是该位置的坐标 (i, j)。
+    // cQ(i,j) 的值就是 (i, j)
     Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));    // (BLK_N,BLK_K) -> (blk_n,blk_k)
     // Tensor tScQ = thr_mma.partition_A(cQ);                           // (MMA,MMA_M,MMA_K)
@@ -266,6 +288,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
     // Prologue
 
     // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
+    // 拷贝了完整的 Q Block 到 shared memory 中
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
                                        binfo.actual_seqlen_q - m_block * kBlockM);
     if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
@@ -285,6 +308,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+    // 把第一块 K 的数据从全局内存拷贝到 shared memory 中
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
                                        binfo.actual_seqlen_k - n_block * kBlockN);
     cute::cp_async_fence();
@@ -323,13 +347,21 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
     /* 循环1： 处理含有 mask 边界的 block */
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
+        /* MMA 是 CUDA 张量核心（Tensor Core）里执行的基本操作：每次 Tensor Core 执行的是一小块 tile 的 A @ B，结果写到 C 的一个小 tile 上。
+           partition_fragment_C(tiled_mma, Shape<kBlockM, kBlockN>) 做的就是：
+           告诉每个线程：你应该在 C 这个 tile 中处理哪一块，并为你分配用于累加结果的寄存器片段。 */
+        // tiled_mma: 定义了整个 thread block 如何安排工作
+        // Shape<Int<kBlockM>, Int<kBlockN>>{}: 需要计算的整个矩阵的形状
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+        // 最后返回值是一个tensor，shape为 (MMA=4, MMA_M, MMA_N)，MMA表示当前线程一共需要几次MMA操作，[MMA_M, MMA_N] 表示一次MMA操作的shape
         clear(acc_s);
+        // 再等上一轮的 copy 操作完成（异步流水线）
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
         // Advance gV
         if (masking_step > 0) {
+            // ! 拷贝 V: 拷贝一个 block 的数据，从 全局内存的 tVgV 中 拷贝到 tVsV 中
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
         } else {
             // Clear the smem tiles to account for predicated off loads
@@ -339,6 +371,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
         }
         cute::cp_async_fence();
 
+
+        // 计算 S = Q * K^T，底层拷贝到寄存器中调用了 cute 中的矩阵乘
         FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -348,6 +382,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
             FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
         }
 
+        // 对 S 应用 mask
         mask.template apply_mask<Is_causal, Is_even_MN>(
             acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
         );
@@ -355,6 +390,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
         if (n_block > n_block_min) {
+            // 拷贝下一轮的 K
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
             // isn't right and we get race conditions.
@@ -362,6 +398,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
         }
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
+        // 应用 softmax，并更新之前的结果 (flash_attention 的核心)，对前面的 O 会进行校准
         masking_step == 0
             ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
@@ -370,6 +407,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
+        // 处理需要返回 softmax 的情况
         if (Return_softmax) {
             Tensor rP_drop = make_fragment_like(rP);
             cute::copy(rP, rP_drop);
@@ -387,6 +425,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params,
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
         // if (cute::thread0()) { print(tOrP); }
+        // 叠加本轮乘以 V 之后的结果
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         // if (cute::thread0()) { print(scores); }
 
