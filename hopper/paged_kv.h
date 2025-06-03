@@ -184,6 +184,7 @@ struct PagedKVManager {
         }
     };
 
+    //! 页表查询的核心函数
     CUTLASS_DEVICE
     TensorKVPtr compute_K_ptr() {
         Tensor tPrKPtr = make_tensor<Element*>(Shape<Int<kPageEntryPerThread>>{});
